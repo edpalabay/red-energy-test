@@ -50,7 +50,7 @@ Assumption: No duplicate 200 records with the same NMI per file. All other .csv 
 Running the Project
 
 Clone the repository:
-git clone https://github.com/edpalabay/SimpleNem12Parser.git
+git clone https://github.com/edpalabay/red-energy-test.git
 cd SimpleNem12Parser
 
 Build the project with Gradle:
