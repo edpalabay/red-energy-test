@@ -51,6 +51,7 @@ Running the Project
 
 Clone the repository:
 git clone https://github.com/edpalabay/red-energy-test.git
+
 cd SimpleNem12Parser
 
 Build the project with Gradle:
