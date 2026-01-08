@@ -2,16 +2,22 @@ package simplenem12;
 
 import java.io.*;
 import java.math.BigDecimal;
+import java.nio.file.Files;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.function.Consumer;
-import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
+import java.nio.charset.StandardCharsets;
 
+/**
+ * Simple NEM12 parser supporting local files and JAR resources.
+ * Reads records (100, 200, 300, 900), builds MeterRead entries,
+ * and groups interval volumes by NMI and date.
+ * Throws IllegalArgumentException on invalid format or missing file/resource.
+ */
 public class SimpleNem12ParserImpl implements SimpleNem12Parser {
-
     private static final Logger LOG = Logger.getLogger(SimpleNem12ParserImpl.class.getName());
     private static final DateTimeFormatter DATE_FORMAT = DateTimeFormatter.ofPattern("yyyyMMdd");
     private static final Pattern DECIMAL = Pattern.compile("-?\\d+(\\.\\d+)?");
@@ -23,52 +29,90 @@ public class SimpleNem12ParserImpl implements SimpleNem12Parser {
         String lastRecord;
     }
 
+    /**
+     * Parses a NEM12 file from disk or JAR classpath.
+     * @param file input file (not null, must exist)
+     * @return parsed MeterRead records
+     * @throws IllegalArgumentException on file/resource or format errors
+     */
     @Override
     public Collection<MeterRead> parseSimpleNem12(File file) {
         if (file == null) {
             throw new IllegalArgumentException("Input file must not be null");
         }
 
-        LOG.info("Starting NEM12 parsing: " + file);
+        String path = file.getPath();
+
+        // Only treat as JAR resource if it REALLY contains '!'
+        if (path.contains("!")) {
+            LOG.info("Detected JAR classpath resource path");
+            String resource = path.substring(path.indexOf("!") + 1);
+
+            // Clean leading slashes or backslashes
+            while (resource.startsWith("/") || resource.startsWith("\\") || resource.startsWith("!")) {
+                resource = resource.substring(1);
+            }
+
+            InputStream jarStream = getClass().getClassLoader().getResourceAsStream(resource);
+            if (jarStream == null) {
+                throw new IllegalArgumentException("Resource not found inside JAR: " + resource);
+            }
+            return parseFromStream(jarStream);
+        }
+
+        // Otherwise it's a normal disk file
+        if (!file.exists()) {
+            throw new IllegalArgumentException("File does not exist: " + path);
+        }
+
+        try {
+            return parseFromStream(Files.newInputStream(file.toPath()));
+        } catch (IOException e) {
+            throw new IllegalArgumentException("Failed to open file: " + path, e);
+        }
+    }
+
+    /**
+     * Parses NEM12 records from an InputStream.
+     * Reads non-empty rows, routes them by record type, and builds MeterRead entries.
+     * @param inputStream source stream (UTF-8)
+     * @return parsed MeterRead records
+     * @throws IllegalArgumentException on read or format errors
+     */
+    private Collection<MeterRead> parseFromStream(InputStream inputStream) {
         LinkedHashSet<MeterRead> reads = new LinkedHashSet<>();
         Cursor cur = new Cursor();
-
-        // Track last non-empty record while reading
         List<String> lines = new ArrayList<>();
-        try (BufferedReader br = new BufferedReader(new FileReader(file))) {
+
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8))) {
             String raw;
             while ((raw = br.readLine()) != null) {
                 cur.line++;
                 String text = raw.trim();
-                if (text.isEmpty()) continue;
-                lines.add(text);
+                if (!text.isEmpty()) {
+                    lines.add(text);
+                    cur.lastRecord = text;
+                }
             }
         } catch (IOException e) {
-            throw new IllegalArgumentException("File access failed at line " + cur.line + ": " + e.getMessage(), e);
+            throw new IllegalArgumentException("Failed to read NEM12 stream", e);
         }
 
-        if (lines.isEmpty()) throw new IllegalArgumentException("File is empty");
-        cur.lastRecord = lines.get(lines.size() - 1);
+        if (lines.isEmpty()) {
+            throw new IllegalArgumentException("Input contains no valid NEM12 records");
+        }
 
         Map<String, Consumer<Record>> router = buildRoutes(reads, cur);
 
-        // Parse each line
         cur.line = 0;
         for (String text : lines) {
             cur.line++;
-            try {
-                Record record = Record.from(text, cur.line);
-                Consumer<Record> handler = router.getOrDefault(record.type, r -> {
-                    throw new IllegalArgumentException("Unsupported record type " + r.type + " at line " + cur.line);
-                });
-                handler.accept(record);
-            } catch (IllegalArgumentException ex) {
-                LOG.log(Level.SEVERE, "Parse error at line " + cur.line + ": " + ex.getMessage(), ex);
-                throw ex;
-            }
+            Record record = Record.from(text, cur.line);
+            Consumer<Record> handler = router.getOrDefault(record.type,
+                    r -> { throw new IllegalArgumentException("Unsupported record type " + r.type + " at line " + cur.line); });
+            handler.accept(record);
         }
 
-        LOG.info("Parsing completed successfully. Total meters: " + reads.size());
         return reads;
     }
 
@@ -89,18 +133,18 @@ public class SimpleNem12ParserImpl implements SimpleNem12Parser {
         });
 
         routes.put("300", r -> {
-            if (cur.active == null) throw bad("Record 300 found without active 200 context");
+            if (cur.active == null) throw bad("Record 300 found without active 200 context at line " + cur.line);
             cur.active.appendVolume(r.date(), r.toMeterVolume());
             LOG.fine("Appended volume to NMI=" + cur.active.getNmi() + " on " + r.date());
         });
 
         routes.put("900", r -> {
-            if (!r.text.equals(cur.lastRecord)) throw bad("Record 900 must be the last non-empty record");
+            if (!r.text.equals(cur.lastRecord)) throw bad("Record 900 must be the last non-empty record at line " + cur.line);
             cur.active = null;
-            LOG.fine("Processed 900 record, parsing complete");
+            LOG.fine("Processed 900, parsing complete");
         });
 
-        return Collections.unmodifiableMap(routes);
+        return routes;
     }
 
     /** Shortcut for throwing parsing errors */
@@ -108,7 +152,9 @@ public class SimpleNem12ParserImpl implements SimpleNem12Parser {
         return new IllegalArgumentException(msg);
     }
 
-    /** Represents a parsed row */
+    /**
+     * Represents a parsed NEM12 row.
+     */
     protected static class Record {
         final String type;
         final String text;
@@ -122,49 +168,45 @@ public class SimpleNem12ParserImpl implements SimpleNem12Parser {
             this.v = v;
         }
 
+        /** Creates a Record from a CSV line */
         static Record from(String line, int lineNo) {
-            if (line == null) {
-                throw new IllegalArgumentException("Null row found at line " + lineNo);
-            }
-
-            String[] v = line.split(",", -1);
-            if (v.length == 0) throw new IllegalArgumentException("Empty record at line " + lineNo);
-            return new Record(v[0], line, lineNo, v);
+            if (line == null) throw new IllegalArgumentException("Null row at line " + lineNo);
+            String[] parts = line.split(",", -1);
+            if (parts.length == 0) throw new IllegalArgumentException("Empty record at line " + lineNo);
+            return new Record(parts[0], line, lineNo, parts);
         }
 
+        /** Parses and returns the record date */
         LocalDate date() {
-            if (v.length < 2 || v[1] == null) {
-                throw bad("Missing date field at line " + line);
-            }
-
+            if (v.length < 2 || v[1] == null) throw new IllegalArgumentException("Missing date at line " + line);
             try {
                 return LocalDate.parse(v[1], DATE_FORMAT);
-            } catch (Exception ex) {
+            } catch (Exception e) {
                 throw new IllegalArgumentException("Invalid date '" + v[1] + "' at line " + line);
             }
         }
 
+        /** Converts a 200 record into a MeterRead */
         MeterRead toMeterRead() {
-            if (v.length != 3) throw bad("Invalid 200 record format at line " + line);
+            if (v.length != 3) throw bad("Invalid 200 format at line " + line);
             String nmi = v[1];
-            if (nmi == null || nmi.length() != 10)
-                throw bad("Invalid NMI in 200 record at line " + line + ": " + nmi);
-            if (!"KWH".equalsIgnoreCase(v[2]))
-                throw bad("Unsupported energy unit in 200 record at line " + line + ": " + v[2]);
+            if (nmi == null || nmi.length() != 10) throw bad("Invalid NMI at line " + line + ": " + nmi);
+            if (!"KWH".equalsIgnoreCase(v[2])) throw bad("Unsupported unit at line " + line + ": " + v[2]);
             return new MeterRead(nmi, EnergyUnit.KWH);
         }
 
+        /** Converts a 300 record into a MeterVolume */
         MeterVolume toMeterVolume() {
-            if (v == null || v.length != 4) throw bad("Invalid 300 record format at line " + line);
-            String vol = v[2];
-            if (vol == null) {
-                throw bad("Volume value is null at line " + line);
-            }
-            if (!DECIMAL.matcher(v[2]).matches())
-                throw bad("Invalid decimal volume in 300 record at line " + line + ": " + v[2]);
-            if (!"A".equals(v[3]) && !"E".equals(v[3]))
-                throw bad("Invalid quality flag in 300 record at line " + line + ": " + v[3]);
+            if (v.length != 4) throw bad("Invalid 300 format at line " + line);
+            if (!DECIMAL.matcher(v[2]).matches()) throw bad("Invalid volume at line " + line + ": " + v[2]);
+            if (!"A".equals(v[3]) && !"E".equals(v[3])) throw bad("Invalid quality at line " + line + ": " + v[3]);
             return new MeterVolume(new BigDecimal(v[2]), Quality.valueOf(v[3]));
         }
+
+        /** Error shortcut */
+        private static IllegalArgumentException bad(String msg) {
+            return new IllegalArgumentException(msg);
+        }
     }
+
 }

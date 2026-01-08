@@ -2,12 +2,11 @@ package simplenem12;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-
 import java.io.File;
 import java.io.FileWriter;
 import java.util.Collection;
-
 import static org.junit.jupiter.api.Assertions.*;
+
 public class SimpleNem12ParseImplTest {
 
     @TempDir
@@ -64,7 +63,7 @@ public class SimpleNem12ParseImplTest {
 
     @Test
     public void failsIf300Before200() throws Exception {
-        String data = "100,NEM12\n300,20250101,1.0,A\n900";
+        String data = "200,NEM12\n300,20250101,1.0,A\n900";
         File f = write("bad300.csv", data);
         SimpleNem12Parser parser = new SimpleNem12ParserImpl();
         assertThrows(IllegalArgumentException.class, () -> parser.parseSimpleNem12(f));
